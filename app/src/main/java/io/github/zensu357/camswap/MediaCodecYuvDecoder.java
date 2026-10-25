@@ -6,6 +6,7 @@ import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.Image;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -17,19 +18,19 @@ import io.github.zensu357.camswap.utils.VideoManager;
 /**
  * Lightweight MediaCodec-based video decoder that outputs YUV_420_888 frames
  * directly, avoiding the expensive GL→Bitmap→RGB→YUV conversion pipeline.
- * <p>
- * Runs on its own decode thread. The latest decoded YUV frame is cached and
- * can be read lock-free from the pump thread via {@link #acquireLatestFrame}.
  */
 final class MediaCodecYuvDecoder {
 
     private static final long TIMEOUT_US = 10_000L;
 
+    // Статическое сохранение позиции декодера при перезапуске камеры в баттлах
+    private static volatile long savedDecodePositionUs = 0L;
+    private static volatile long savedDecodeRealtimeMs = 0L;
+    private static volatile String lastDecodedVideoPath = "";
+
     private volatile boolean running;
     private Thread decodeThread;
 
-    // Latest decoded frame — written by decode thread, read by pump thread.
-    // Access is guarded by volatile reference swap (single writer, single reader).
     private volatile YuvFrame latestFrame;
 
     // Video metadata
@@ -57,7 +58,6 @@ final class MediaCodecYuvDecoder {
         }
     }
 
-    /** Start decoding the current video source on a background thread. */
     void start() {
         if (running) return;
         running = true;
@@ -66,7 +66,6 @@ final class MediaCodecYuvDecoder {
         decodeThread.start();
     }
 
-    /** Stop decoding and release resources. Safe to call from any thread. */
     void stop() {
         running = false;
         Thread t = decodeThread;
@@ -85,12 +84,10 @@ final class MediaCodecYuvDecoder {
         return running;
     }
 
-    /** Returns the latest decoded YUV frame, or null if none available yet. */
     YuvFrame acquireLatestFrame() {
         return latestFrame;
     }
 
-    /** 将当前解码出的 YUV 帧合成为标准的 NV21 (Y...VU...) 字节流 */
     public byte[] acquireLatestNv21Frame() {
         YuvFrame frame = latestFrame;
         if (frame == null || frame.yPlane == null || frame.uPlane == null || frame.vPlane == null) {
@@ -115,7 +112,46 @@ final class MediaCodecYuvDecoder {
     int getVideoHeight() { return videoHeight; }
     int getVideoRotation() { return videoRotation; }
 
-    // -----------------------------------------------------------------------
+    private long resolveResumePositionUs(String videoPath, long durationUs) {
+        if (videoPath != null && !videoPath.equals(lastDecodedVideoPath)) {
+            lastDecodedVideoPath = videoPath;
+            savedDecodePositionUs = 0L;
+            savedDecodeRealtimeMs = 0L;
+        }
+
+        // 1. Приоритет: синхронизация с основным MediaPlayerManager (и звуком Video Sync)
+        try {
+            if (HookMain.playerManager != null) {
+                long playerPosMs = HookMain.playerManager.getCamera2PlaybackPositionMs();
+                if (playerPosMs > 0) {
+                    long posUs = playerPosMs * 1000L;
+                    if (durationUs > 0) {
+                        posUs = posUs % durationUs;
+                    }
+                    savedDecodePositionUs = posUs;
+                    savedDecodeRealtimeMs = SystemClock.elapsedRealtime();
+                    return posUs;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        // 2. Резерв: собственная сохраненная позиция декодера + время переключения
+        if (savedDecodePositionUs > 0L) {
+            long targetUs = savedDecodePositionUs;
+            if (savedDecodeRealtimeMs > 0L) {
+                long deltaMs = SystemClock.elapsedRealtime() - savedDecodeRealtimeMs;
+                if (deltaMs > 0 && deltaMs < 30_000L) {
+                    targetUs += deltaMs * 1000L;
+                }
+            }
+            if (durationUs > 0L) {
+                targetUs = targetUs % durationUs;
+            }
+            return targetUs;
+        }
+        return 0L;
+    }
 
     private void decodeLoop() {
         while (running) {
@@ -124,11 +160,9 @@ final class MediaCodecYuvDecoder {
             } catch (Exception e) {
                 if (running) {
                     LogUtil.log("【CS】YuvDecoder 异常: " + e);
-                    // brief pause before retry
                     try { Thread.sleep(500); } catch (InterruptedException ie) { break; }
                 }
             }
-            // Loop: seek back to beginning for looped playback
         }
     }
 
@@ -165,14 +199,17 @@ final class MediaCodecYuvDecoder {
             }
             if (videoFrameRate <= 0) videoFrameRate = 30;
 
-            // Detect video rotation
+            long durationUs = 0L;
+            if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                durationUs = format.getLong(MediaFormat.KEY_DURATION);
+            }
+
             if (format.containsKey(MediaFormat.KEY_ROTATION)) {
                 videoRotation = format.getInteger(MediaFormat.KEY_ROTATION);
             } else {
                 videoRotation = 0;
             }
 
-            // Configure decoder for raw buffer output (no Surface) → YUV
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
 
@@ -180,11 +217,13 @@ final class MediaCodecYuvDecoder {
             decoder.configure(format, null, null, 0);
             decoder.start();
 
-            LogUtil.log("【CS】【YUV解码器】硬件解码器启动成功！(名称: " + decoder.getName()
-                    + ", MIME: " + mime + ", 视频规格: " + videoWidth + "x" + videoHeight
-                    + " @" + videoFrameRate + "fps, 旋转角: " + videoRotation + "°)");
+            long resumePosUs = resolveResumePositionUs(videoPath, durationUs);
+            if (resumePosUs > 0L) {
+                extractor.seekTo(resumePosUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                LogUtil.log("【CS】【YUV解码器】Продолжение декодирования с позиции: " + (resumePosUs / 1000L) + " ms");
+            }
 
-            decodeFrames(decoder, extractor);
+            decodeFrames(decoder, extractor, resumePosUs);
 
         } finally {
             if (decoder != null) {
@@ -198,16 +237,15 @@ final class MediaCodecYuvDecoder {
         }
     }
 
-    private void decodeFrames(MediaCodec decoder, MediaExtractor extractor) {
+    private void decodeFrames(MediaCodec decoder, MediaExtractor extractor, long initialSeekUs) {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         boolean sawInputEOS = false;
+        long basePtsUs = -1L;
         long startTimeMs = System.currentTimeMillis();
 
-        // Reusable plane buffers — avoid allocation per frame
         byte[] yBuf = null, uBuf = null, vBuf = null;
 
         while (running) {
-            // Feed input
             if (!sawInputEOS) {
                 int inIdx = decoder.dequeueInputBuffer(TIMEOUT_US);
                 if (inIdx >= 0) {
@@ -225,20 +263,30 @@ final class MediaCodecYuvDecoder {
                 }
             }
 
-            // Read output
             int outIdx = decoder.dequeueOutputBuffer(info, TIMEOUT_US);
             if (outIdx >= 0) {
                 if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                     decoder.releaseOutputBuffer(outIdx, false);
-                    // End of video — seek back for loop
+                    // Конец видео — перематываем в начало для бесконечного цикла
                     extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
                     decoder.flush();
                     sawInputEOS = false;
+                    savedDecodePositionUs = 0L;
+                    savedDecodeRealtimeMs = SystemClock.elapsedRealtime();
+                    basePtsUs = -1L;
                     startTimeMs = System.currentTimeMillis();
                     continue;
                 }
 
                 if (info.size > 0) {
+                    if (basePtsUs < 0L) {
+                        basePtsUs = info.presentationTimeUs;
+                        startTimeMs = System.currentTimeMillis();
+                    }
+
+                    savedDecodePositionUs = info.presentationTimeUs;
+                    savedDecodeRealtimeMs = SystemClock.elapsedRealtime();
+
                     Image image = decoder.getOutputImage(outIdx);
                     if (image != null) {
                         try {
@@ -247,7 +295,6 @@ final class MediaCodecYuvDecoder {
                             int yLen = w * h;
                             int cLen = (w / 2) * (h / 2);
 
-                            // Allocate/reuse buffers
                             if (yBuf == null || yBuf.length != yLen) {
                                 yBuf = new byte[yLen];
                                 uBuf = new byte[cLen];
@@ -256,7 +303,6 @@ final class MediaCodecYuvDecoder {
 
                             extractYuvPlanes(image, w, h, yBuf, uBuf, vBuf);
 
-                            // Publish frame (copy for immutability)
                             byte[] yOut = new byte[yLen];
                             byte[] uOut = new byte[cLen];
                             byte[] vOut = new byte[cLen];
@@ -269,11 +315,11 @@ final class MediaCodecYuvDecoder {
                         }
                     }
 
-                    // Pace output to video frame rate
-                    long targetTimeMs = info.presentationTimeUs / 1000;
-                    long elapsed = System.currentTimeMillis() - startTimeMs;
-                    long sleepMs = targetTimeMs - elapsed;
-                    if (sleepMs > 2) {
+                    // Выдерживаем тайминг кадров относительно точки старта/перемотки
+                    long targetElapsedMs = Math.max(0L, (info.presentationTimeUs - basePtsUs) / 1000L);
+                    long actualElapsedMs = System.currentTimeMillis() - startTimeMs;
+                    long sleepMs = targetElapsedMs - actualElapsedMs;
+                    if (sleepMs > 2 && sleepMs < 5000) {
                         try { Thread.sleep(sleepMs); } catch (InterruptedException e) { break; }
                     }
                 }
@@ -282,14 +328,9 @@ final class MediaCodecYuvDecoder {
         }
     }
 
-    /**
-     * Extract Y, U, V planes from a decoder output Image into flat byte arrays.
-     * Handles varying row strides and pixel strides.
-     */
     private static void extractYuvPlanes(Image image, int w, int h,
                                           byte[] yOut, byte[] uOut, byte[] vOut) {
         Image.Plane[] planes = image.getPlanes();
-        // Y plane
         ByteBuffer yBuf = planes[0].getBuffer();
         int yRowStride = planes[0].getRowStride();
         int yPixelStride = planes[0].getPixelStride();
@@ -310,7 +351,6 @@ final class MediaCodecYuvDecoder {
             }
         }
 
-        // U and V planes
         int cw = w / 2;
         int ch = h / 2;
         ByteBuffer uBuf = planes[1].getBuffer();
@@ -322,11 +362,9 @@ final class MediaCodecYuvDecoder {
 
         if (uPixelStride == 1 && uRowStride == cw
                 && vPixelStride == 1 && vRowStride == cw) {
-            // Ideal: packed planar
             uBuf.get(uOut, 0, cw * ch);
             vBuf.get(vOut, 0, cw * ch);
         } else if (uPixelStride == 2 && vPixelStride == 2) {
-            // Common NV12/NV21 interleaved UV: pixel stride 2
             for (int row = 0; row < ch; row++) {
                 int srcBase = row * uRowStride;
                 int dstBase = row * cw;
@@ -336,7 +374,6 @@ final class MediaCodecYuvDecoder {
                 }
             }
         } else {
-            // General case
             for (int row = 0; row < ch; row++) {
                 int dstBase = row * cw;
                 for (int col = 0; col < cw; col++) {
